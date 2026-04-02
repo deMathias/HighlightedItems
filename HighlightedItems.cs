@@ -30,9 +30,12 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
     private string _editQuery = "";
     private string _editName = "";
     private string _editFolder = "";
-    private string _newQuery = "";
-    private string _newName = "";
-    private string _newFolder = "";
+    private string _saveAsQuerySnapshot = "";
+    private string _saveAsName = "";
+    private string _saveAsFolder = "";
+    private string _folderDeleteKey;
+    private string _folderDeleteLabel;
+    private bool _openFolderDeleteConfirm;
 
     private record QueryOrException(ItemQuery Query, Exception Exception);
 
@@ -112,34 +115,71 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         return false;
     }
 
+    private static string TruncateUi(string text, int maxLen)
+    {
+        if (string.IsNullOrEmpty(text)) return "";
+        return text.Length <= maxLen ? text : text.Substring(0, maxLen - 1) + "…";
+    }
+
+    private static string LineLabel(SavedFilter f) =>
+        string.IsNullOrEmpty(f.DisplayName) ? TruncateUi(f.Query, 36) : TruncateUi(f.DisplayName, 44);
+
+    private void RemoveFiltersInFolder(string folderKey)
+    {
+        var key = folderKey ?? "";
+        Settings.SavedFilterEntries.RemoveAll(x => (x.Folder ?? "") == key);
+    }
+
     private Predicate<Entity> GetPredicate(ref string filterText, Vector2 defaultPosition)
     {
         if (!Settings.ShowCustomFilterWindow)
             return null;
         Settings.SavedFilters ??= [];
         Settings.SavedFilterEntries ??= [];
+        ImGui.SetNextWindowSizeConstraints(new Vector2(340, 200), new Vector2(900, 1200));
+        ImGui.SetNextWindowSize(new Vector2(440, 560), ImGuiCond.FirstUseEver);
         ImGui.SetNextWindowPos(defaultPosition, ImGuiCond.FirstUseEver);
-        if (!ImGui.Begin("Custom filter", ImGuiWindowFlags.NoDecoration | ImGuiWindowFlags.AlwaysAutoResize))
+        if (!ImGui.Begin("Custom filter", ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoCollapse))
             return null;
+        ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new Vector2(8, 7));
+        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(8, 5));
         MigrateLegacySavedFilters();
         ImGui.TextUnformatted("Active IFL filter");
-        ImGui.InputTextMultiline("##input", ref filterText, 8000, new Vector2(320, 128));
+        ImGui.InputTextMultiline("##input", ref filterText, 8000, new Vector2(-1, 150));
         Predicate<Entity> returnValue = null;
         if (ImGui.Button("Clear"))
             filterText = "";
+        ImGui.SameLine();
         var trimmed = filterText.Trim();
-        if (!string.IsNullOrEmpty(trimmed) && !Settings.SavedFilterEntries.Any(x => x.Query == trimmed))
+        ImGui.BeginDisabled(string.IsNullOrWhiteSpace(trimmed));
+        if (ImGui.Button("Save"))
         {
-            ImGui.SameLine();
+            _saveAsQuerySnapshot = trimmed;
+            _saveAsName = trimmed.Length > 48 ? trimmed.Substring(0, 45) + "…" : trimmed;
+            _saveAsFolder = "";
+            ImGui.OpenPopup("hi_save_active_filter");
+        }
+        ImGui.EndDisabled();
+        if (ImGui.BeginPopup("hi_save_active_filter"))
+        {
+            ImGui.TextUnformatted("Name");
+            ImGui.InputTextWithHint("##saveasname", "Name", ref _saveAsName, 128);
+            ImGui.TextUnformatted("Group");
+            ImGui.InputTextWithHint("##saveasfolder", "Group", ref _saveAsFolder, 64);
             if (ImGui.Button("Save"))
             {
-                Settings.SavedFilterEntries.Add(new SavedFilter
+                var q = _saveAsQuerySnapshot;
+                if (!string.IsNullOrWhiteSpace(q))
                 {
-                    DisplayName = trimmed.Length > 48 ? trimmed.Substring(0, 45) + "…" : trimmed,
-                    Query = trimmed,
-                    Folder = ""
-                });
+                    var dn = string.IsNullOrWhiteSpace(_saveAsName.Trim()) ? TruncateUi(q, 48) : _saveAsName.Trim();
+                    Settings.SavedFilterEntries.Add(new SavedFilter { DisplayName = dn, Query = q.Trim(), Folder = _saveAsFolder ?? "" });
+                }
+                ImGui.CloseCurrentPopup();
             }
+            ImGui.SameLine();
+            if (ImGui.Button("Cancel"))
+                ImGui.CloseCurrentPopup();
+            ImGui.EndPopup();
         }
         if (!string.IsNullOrEmpty(trimmed))
         {
@@ -173,6 +213,7 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                     }
                 };
         }
+        ImGui.Separator();
         if (Settings.UsePopupForFilterSelector)
         {
             if (ImGui.Button("Open Saved Filters"))
@@ -195,41 +236,66 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             if (!Settings.SavedFilterEntries.Any())
                 ImGui.TextUnformatted("No saved filters yet.");
             else
-                DrawSavedFilterRows(ref filterText);
-            ImGui.TreePop();
-        }
-        if (ImGui.TreeNodeEx("Add new IFL Filter"))
-        {
-            ImGui.TextUnformatted("Display name");
-            ImGui.InputTextWithHint("##addname", "Short name", ref _newName, 128);
-            ImGui.TextUnformatted("Folder");
-            ImGui.InputTextWithHint("##addfolder", "Optional", ref _newFolder, 64);
-            ImGui.TextUnformatted("IFL query");
-            ImGui.InputTextMultiline("##addquery", ref _newQuery, 8000, new Vector2(320, 128));
-            if (ImGui.Button("Add") && !string.IsNullOrWhiteSpace(_newQuery))
             {
-                var q = _newQuery.Trim();
-                var dn = string.IsNullOrWhiteSpace(_newName) ? (q.Length > 48 ? q.Substring(0, 45) + "…" : q) : _newName;
-                Settings.SavedFilterEntries.Add(new SavedFilter { DisplayName = dn, Query = q, Folder = _newFolder ?? "" });
-                _newQuery = "";
-                _newName = "";
-                _newFolder = "";
+                var savedH = Math.Max(120f, ImGui.GetContentRegionAvail().Y);
+                ImGui.BeginChild("##saved_scroll", new Vector2(0, savedH), ImGuiChildFlags.Border, ImGuiWindowFlags.HorizontalScrollbar);
+                DrawSavedFilterRows(ref filterText);
+                ImGui.EndChild();
             }
             ImGui.TreePop();
         }
+        if (_openFolderDeleteConfirm)
+        {
+            ImGui.OpenPopup("hi_confirm_folder_delete");
+            _openFolderDeleteConfirm = false;
+        }
+        if (ImGui.BeginPopup("hi_confirm_folder_delete"))
+        {
+            ImGui.TextUnformatted($"Remove all filters in \"{_folderDeleteLabel}\"?");
+            if (ImGui.Button("Remove all"))
+            {
+                RemoveFiltersInFolder(_folderDeleteKey);
+                ImGui.CloseCurrentPopup();
+            }
+            ImGui.SameLine();
+            if (ImGui.Button("Cancel"))
+                ImGui.CloseCurrentPopup();
+            ImGui.EndPopup();
+        }
+        ImGui.PopStyleVar(2);
         ImGui.End();
         return returnValue;
     }
 
     private void DrawSavedFilterRows(ref string filterText)
     {
+        ImGui.TextDisabled("Hover a name for full IFL; hold Shift and click Delete to remove a filter.");
+        ImGui.Spacing();
+        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(9, 5));
+        ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new Vector2(8, 6));
         var list = Settings.SavedFilterEntries;
         foreach (var folderGroup in list.Select((f, i) => (f, i)).GroupBy(t => t.f.Folder ?? "").OrderBy(g => g.Key))
         {
             var label = string.IsNullOrEmpty(folderGroup.Key) ? "General" : folderGroup.Key;
             ImGui.PushID($"fld_{label}");
-            if (ImGui.TreeNodeEx(label, ImGuiTreeNodeFlags.DefaultOpen))
+            var folderId = $"##fld_{folderGroup.Key.GetHashCode():X8}";
+            var treeOpen = ImGui.TreeNodeEx(folderId, ImGuiTreeNodeFlags.DefaultOpen);
+            ImGui.SameLine();
+            ImGui.TextUnformatted(label);
+            ImGui.SameLine(0, 8f);
+            ImGui.PushID("foldtools");
+            if (ImGui.Button("Delete group"))
             {
+                _folderDeleteKey = folderGroup.Key;
+                _folderDeleteLabel = label;
+                _openFolderDeleteConfirm = true;
+            }
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip("Remove every filter in this folder");
+            ImGui.PopID();
+            if (treeOpen)
+            {
+                ImGui.Separator();
                 foreach (var (savedFilter, index) in folderGroup.OrderBy(x => x.i))
                 {
                     ImGui.PushID($"saved{index}");
@@ -276,9 +342,9 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                         ImGui.TextUnformatted("Display name");
                         ImGui.InputTextWithHint("##editname", "Short name", ref _editName, 128);
                         ImGui.TextUnformatted("Folder");
-                        ImGui.InputTextWithHint("##editfolder", "Optional", ref _editFolder, 64);
+                        ImGui.InputTextWithHint("##editfolder", "Optional group", ref _editFolder, 64);
                         ImGui.TextUnformatted("IFL query");
-                        ImGui.InputTextMultiline("##editquery", ref _editQuery, 8000, new Vector2(320, 128));
+                        ImGui.InputTextMultiline("##editquery", ref _editQuery, 8000, new Vector2(-1, 150));
                         if (ImGui.Button("Save"))
                         {
                             savedFilter.Query = _editQuery.Trim();
@@ -300,15 +366,22 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                     else if (ImGui.IsItemHovered())
                         ImGui.SetTooltip("Hold Shift");
                     ImGui.SameLine();
-                    ImGui.TextUnformatted(string.IsNullOrEmpty(savedFilter.DisplayName) ? savedFilter.Query : savedFilter.DisplayName);
+                    ImGui.TextUnformatted(LineLabel(savedFilter));
                     if (ImGui.IsItemHovered())
-                        ImGui.SetTooltip(savedFilter.Query);
+                    {
+                        ImGui.BeginTooltip();
+                        ImGui.PushTextWrapPos(ImGui.GetFontSize() * 42);
+                        ImGui.TextUnformatted(savedFilter.Query);
+                        ImGui.PopTextWrapPos();
+                        ImGui.EndTooltip();
+                    }
                     ImGui.PopID();
                 }
                 ImGui.TreePop();
             }
             ImGui.PopID();
         }
+        ImGui.PopStyleVar(2);
     }
 
     public override void Render()
