@@ -1,4 +1,4 @@
-﻿using System.Collections.Generic;
+using System.Collections.Generic;
 using System.Windows.Forms;
 using ExileCore.Shared.Attributes;
 using ExileCore.Shared.Interfaces;
@@ -63,5 +63,9 @@ public class Settings : ISettings
     public List<string> SavedFilters { get; set; } = [];
 
     [IgnoreMenu]
+    public List<SavedFilter> SavedFilterEntries { get; set; } = [];
+
+    [IgnoreMenu]
     public bool OpenSavedFilterList { get; set; } = true;
+
 }

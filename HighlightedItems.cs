@@ -1,4 +1,4 @@
-﻿using System.Windows.Forms;
+using System.Windows.Forms;
 using HighlightedItems.Utils;
 using ExileCore;
 using ExileCore.PoEMemory.Elements.InventoryElements;
@@ -25,8 +25,14 @@ namespace HighlightedItems;
 public class HighlightedItems : BaseSettingsPlugin<Settings>
 {
     private SyncTask<bool> _currentOperation;
-    private string _customStashFilter = "";
-    private string _customInventoryFilter = "";
+    private string _customItemFilter = "";
+    private int? _editFilterIndex;
+    private string _editQuery = "";
+    private string _editName = "";
+    private string _editFolder = "";
+    private string _newQuery = "";
+    private string _newName = "";
+    private string _newFolder = "";
 
     private record QueryOrException(ItemQuery Query, Exception Exception);
 
@@ -38,6 +44,7 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
 
     public override bool Initialise()
     {
+        MigrateLegacySavedFilters();
         Graphics.InitImage(Path.Combine(DirectoryFullName, "images\\pick.png").Replace('\\', '/'), false);
         Graphics.InitImage(Path.Combine(DirectoryFullName, "images\\pickL.png").Replace('\\', '/'), false);
 
@@ -55,130 +62,253 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         DrawIgnoredCellsSettings();
     }
 
-    private Predicate<Entity> GetPredicate(string windowTitle, ref string filterText, Vector2 defaultPosition)
+    private void MigrateLegacySavedFilters()
     {
-        if (!Settings.ShowCustomFilterWindow) return null;
         Settings.SavedFilters ??= [];
-        ImGui.SetNextWindowPos(defaultPosition, ImGuiCond.FirstUseEver);
-        if (ImGui.Begin(windowTitle, ImGuiWindowFlags.NoDecoration | ImGuiWindowFlags.AlwaysAutoResize))
+        Settings.SavedFilterEntries ??= [];
+        if (Settings.SavedFilters.Count == 0)
+            return;
+        foreach (var q in Settings.SavedFilters)
         {
-            ImGui.InputTextWithHint("##input", "Filter using IFL syntax", ref filterText, 2000);
-            Predicate<Entity> returnValue = null;
-            if (!string.IsNullOrWhiteSpace(filterText))
+            if (string.IsNullOrEmpty(q))
+                continue;
+            if (Settings.SavedFilterEntries.Any(e => e.Query == q))
+                continue;
+            var name = q.Length > 48 ? q.Substring(0, 45) + "…" : q;
+            Settings.SavedFilterEntries.Add(new SavedFilter { DisplayName = name, Query = q, Folder = "" });
+        }
+        Settings.SavedFilters.Clear();
+    }
+
+    private bool TryGetFilterAnchor(out Vector2 anchor)
+    {
+        anchor = default;
+        var ui = InGameState.IngameUi;
+        if (ui.StashElement is { IsVisible: true, VisibleStash: { InventoryUIElement: { } inv } })
+        {
+            anchor = inv.GetClientRectCache.BottomLeft.ToVector2Num();
+            return true;
+        }
+        if (ui.GuildStashElement is { IsVisible: true, VisibleStash: { InventoryUIElement: { } inv2 } })
+        {
+            anchor = inv2.GetClientRectCache.BottomLeft.ToVector2Num();
+            return true;
+        }
+        if (ui.InventoryPanel.IsVisible)
+        {
+            anchor = ui.InventoryPanel[2].GetClientRectCache.BottomLeft.ToVector2Num();
+            return true;
+        }
+        if (ui.TradeWindow is { IsVisible: true })
+        {
+            anchor = ui.TradeWindow.GetClientRectCache.BottomLeft.ToVector2Num();
+            return true;
+        }
+        if (ui.SellWindow is { IsVisible: true })
+        {
+            anchor = ui.SellWindow.GetClientRectCache.BottomLeft.ToVector2Num();
+            return true;
+        }
+        return false;
+    }
+
+    private Predicate<Entity> GetPredicate(ref string filterText, Vector2 defaultPosition)
+    {
+        if (!Settings.ShowCustomFilterWindow)
+            return null;
+        Settings.SavedFilters ??= [];
+        Settings.SavedFilterEntries ??= [];
+        ImGui.SetNextWindowPos(defaultPosition, ImGuiCond.FirstUseEver);
+        if (!ImGui.Begin("Custom filter", ImGuiWindowFlags.NoDecoration | ImGuiWindowFlags.AlwaysAutoResize))
+            return null;
+        MigrateLegacySavedFilters();
+        ImGui.TextUnformatted("Active IFL filter");
+        ImGui.InputTextMultiline("##input", ref filterText, 8000, new Vector2(320, 128));
+        Predicate<Entity> returnValue = null;
+        if (ImGui.Button("Clear"))
+            filterText = "";
+        var trimmed = filterText.Trim();
+        if (!string.IsNullOrEmpty(trimmed) && !Settings.SavedFilterEntries.Any(x => x.Query == trimmed))
+        {
+            ImGui.SameLine();
+            if (ImGui.Button("Save"))
             {
-                ImGui.SameLine();
-                if (ImGui.Button("Clear"))
+                Settings.SavedFilterEntries.Add(new SavedFilter
                 {
-                    filterText = "";
-                    return null;
-                }
-
-                if (!Settings.SavedFilters.Contains(filterText))
+                    DisplayName = trimmed.Length > 48 ? trimmed.Substring(0, 45) + "…" : trimmed,
+                    Query = trimmed,
+                    Folder = ""
+                });
+            }
+        }
+        if (!string.IsNullOrEmpty(trimmed))
+        {
+            var (query, exception) = _queries.GetValue(trimmed, s =>
+            {
+                try
                 {
-                    ImGui.SameLine();
-                    if (ImGui.Button("Save"))
-                    {
-                        Settings.SavedFilters.Add(filterText);
-                    }
+                    var itemQuery = ItemQuery.Load(s);
+                    if (itemQuery.FailedToCompile)
+                        return new QueryOrException(null, new Exception(itemQuery.Error));
+                    return new QueryOrException(itemQuery, null);
                 }
-
-                var (query, exception) = _queries.GetValue(filterText, s =>
+                catch (Exception ex)
+                {
+                    return new QueryOrException(null, ex);
+                }
+            })!;
+            if (exception != null)
+                ImGui.TextUnformatted($"{exception.Message}");
+            else
+                returnValue = s =>
                 {
                     try
                     {
-                        var itemQuery = ItemQuery.Load(s);
-                        if (itemQuery.FailedToCompile)
-                        {
-                            return new QueryOrException(null, new Exception(itemQuery.Error));
-                        }
-
-                        return new QueryOrException(itemQuery, null);
+                        return query.CompiledQuery(new ItemData(s, GameController));
                     }
                     catch (Exception ex)
                     {
-                        return new QueryOrException(null, ex);
+                        DebugWindow.LogError($"Failed to match item: {ex}");
+                        return false;
                     }
-                })!;
-
-                if (exception != null)
-                {
-                    ImGui.TextUnformatted($"{exception.Message}");
-                }
-                else
-                {
-                    returnValue = s =>
-                    {
-                        try
-                        {
-                            return query.CompiledQuery(new ItemData(s, GameController));
-                        }
-                        catch (Exception ex)
-                        {
-                            DebugWindow.LogError($"Failed to match item: {ex}");
-                            return false;
-                        }
-                    };
-                }
-            }
-
-            // ReSharper disable once AssignmentInConditionalExpression
-            if (Settings.SavedFilters.Any() && Settings.UsePopupForFilterSelector
-                    ? Settings.OpenSavedFilterList = ImGui.BeginPopupContextItem("saved_filter_popup")
-                    : Settings.OpenSavedFilterList = ImGui.TreeNodeEx("Saved filters",
-                        Settings.OpenSavedFilterList
-                            ? ImGuiTreeNodeFlags.DefaultOpen | ImGuiTreeNodeFlags.NoTreePushOnOpen
-                            : ImGuiTreeNodeFlags.NoTreePushOnOpen))
+                };
+        }
+        if (Settings.UsePopupForFilterSelector)
+        {
+            if (ImGui.Button("Open Saved Filters"))
+                ImGui.OpenPopup("saved_filter_popup");
+            if (ImGui.BeginPopup("saved_filter_popup"))
             {
-                foreach (var (savedFilter, index) in Settings.SavedFilters.Select((x, i) => (x, i)).ToList())
+                if (!Settings.SavedFilterEntries.Any())
+                    ImGui.TextUnformatted("No saved filters yet.");
+                else
+                    DrawSavedFilterRows(ref filterText);
+                ImGui.EndPopup();
+            }
+        }
+        // ReSharper disable once AssignmentInConditionalExpression
+        else if (Settings.OpenSavedFilterList = ImGui.TreeNodeEx("Saved filters",
+                     Settings.OpenSavedFilterList
+                         ? ImGuiTreeNodeFlags.DefaultOpen | ImGuiTreeNodeFlags.NoTreePushOnOpen
+                         : ImGuiTreeNodeFlags.NoTreePushOnOpen))
+        {
+            if (!Settings.SavedFilterEntries.Any())
+                ImGui.TextUnformatted("No saved filters yet.");
+            else
+                DrawSavedFilterRows(ref filterText);
+            ImGui.TreePop();
+        }
+        if (ImGui.TreeNodeEx("Add new IFL Filter"))
+        {
+            ImGui.TextUnformatted("Display name");
+            ImGui.InputTextWithHint("##addname", "Short name", ref _newName, 128);
+            ImGui.TextUnformatted("Folder");
+            ImGui.InputTextWithHint("##addfolder", "Optional", ref _newFolder, 64);
+            ImGui.TextUnformatted("IFL query");
+            ImGui.InputTextMultiline("##addquery", ref _newQuery, 8000, new Vector2(320, 128));
+            if (ImGui.Button("Add") && !string.IsNullOrWhiteSpace(_newQuery))
+            {
+                var q = _newQuery.Trim();
+                var dn = string.IsNullOrWhiteSpace(_newName) ? (q.Length > 48 ? q.Substring(0, 45) + "…" : q) : _newName;
+                Settings.SavedFilterEntries.Add(new SavedFilter { DisplayName = dn, Query = q, Folder = _newFolder ?? "" });
+                _newQuery = "";
+                _newName = "";
+                _newFolder = "";
+            }
+            ImGui.TreePop();
+        }
+        ImGui.End();
+        return returnValue;
+    }
+
+    private void DrawSavedFilterRows(ref string filterText)
+    {
+        var list = Settings.SavedFilterEntries;
+        foreach (var folderGroup in list.Select((f, i) => (f, i)).GroupBy(t => t.f.Folder ?? "").OrderBy(g => g.Key))
+        {
+            var label = string.IsNullOrEmpty(folderGroup.Key) ? "General" : folderGroup.Key;
+            ImGui.PushID($"fld_{label}");
+            if (ImGui.TreeNodeEx(label, ImGuiTreeNodeFlags.DefaultOpen))
+            {
+                foreach (var (savedFilter, index) in folderGroup.OrderBy(x => x.i))
                 {
                     ImGui.PushID($"saved{index}");
-                    if (ImGui.Button("Load"))
+                    ImGui.Button("≡");
+                    if (ImGui.IsItemHovered())
+                        ImGui.SetTooltip("Drag to reorder");
+                    if (ImGui.BeginDragDropSource(ImGuiDragDropFlags.None))
                     {
-                        filterText = savedFilter;
+                        ImGuiHelpers.SetDragDropPayload("HI_FILTER_ITEM", index);
+                        ImGui.EndDragDropSource();
                     }
-
+                    if (ImGui.BeginDragDropTarget())
+                    {
+                        var payload = ImGuiHelpers.AcceptDragDropPayload<int>("HI_FILTER_ITEM");
+                        if (payload.HasValue)
+                        {
+                            var srcIndex = payload.Value;
+                            if (srcIndex >= 0 && srcIndex < list.Count && srcIndex != index)
+                            {
+                                var item = list[srcIndex];
+                                list.RemoveAt(srcIndex);
+                                var insertIndex = index;
+                                if (insertIndex > srcIndex)
+                                    insertIndex--;
+                                list.Insert(insertIndex, item);
+                            }
+                        }
+                        ImGui.EndDragDropTarget();
+                    }
+                    ImGui.SameLine();
+                    if (ImGui.Button("Load"))
+                        filterText = savedFilter.Query;
+                    ImGui.SameLine();
+                    if (ImGui.Button("Edit"))
+                    {
+                        _editFilterIndex = index;
+                        _editQuery = savedFilter.Query;
+                        _editName = savedFilter.DisplayName;
+                        _editFolder = savedFilter.Folder ?? "";
+                        ImGui.OpenPopup($"hi_edit_{index}");
+                    }
+                    if (ImGui.BeginPopup($"hi_edit_{index}"))
+                    {
+                        ImGui.TextUnformatted("Display name");
+                        ImGui.InputTextWithHint("##editname", "Short name", ref _editName, 128);
+                        ImGui.TextUnformatted("Folder");
+                        ImGui.InputTextWithHint("##editfolder", "Optional", ref _editFolder, 64);
+                        ImGui.TextUnformatted("IFL query");
+                        ImGui.InputTextMultiline("##editquery", ref _editQuery, 8000, new Vector2(320, 128));
+                        if (ImGui.Button("Save"))
+                        {
+                            savedFilter.Query = _editQuery.Trim();
+                            savedFilter.DisplayName = _editName;
+                            savedFilter.Folder = _editFolder ?? "";
+                            ImGui.CloseCurrentPopup();
+                            _editFilterIndex = null;
+                        }
+                        ImGui.EndPopup();
+                    }
+                    else if (_editFilterIndex == index)
+                        _editFilterIndex = null;
                     ImGui.SameLine();
                     if (ImGui.Button("Delete"))
                     {
                         if (ImGui.IsKeyDown(ImGuiKey.ModShift))
-                        {
-                            Settings.SavedFilters.Remove(savedFilter);
-                        }
+                            list.Remove(savedFilter);
                     }
                     else if (ImGui.IsItemHovered())
-                    {
                         ImGui.SetTooltip("Hold Shift");
-                    }
-
                     ImGui.SameLine();
-                    ImGui.TextUnformatted(savedFilter);
-
+                    ImGui.TextUnformatted(string.IsNullOrEmpty(savedFilter.DisplayName) ? savedFilter.Query : savedFilter.DisplayName);
+                    if (ImGui.IsItemHovered())
+                        ImGui.SetTooltip(savedFilter.Query);
                     ImGui.PopID();
                 }
-
-                if (Settings.UsePopupForFilterSelector)
-                {
-                    ImGui.EndPopup();
-                }
-                else
-                {
-                    ImGui.TreePop();
-                }
+                ImGui.TreePop();
             }
-
-            if (Settings.UsePopupForFilterSelector)
-            {
-                if (ImGui.Button("Open Saved Filters"))
-                {
-                    ImGui.OpenPopup("saved_filter_popup");
-                }
-            }
-
-            ImGui.End();
-            return returnValue;
+            ImGui.PopID();
         }
-
-        return null;
     }
 
     public override void Render()
@@ -200,6 +330,14 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         if (!Settings.Enable)
             return;
 
+        var panelsOpen = TryGetFilterAnchor(out var filterAnchor);
+        if (Settings.ResetCustomFilterOnPanelClose && !panelsOpen)
+            _customItemFilter = "";
+
+        Predicate<Entity> entityPredicate = null;
+        if (panelsOpen && Settings.ShowCustomFilterWindow)
+            entityPredicate = GetPredicate(ref _customItemFilter, filterAnchor);
+
         var (inventory, rectElement) = (InGameState.IngameUi.StashElement, InGameState.IngameUi.GuildStashElement) switch
         {
             ({ IsVisible: true, VisibleStash: { InventoryUIElement: { } invRect } visibleStash }, _) => (visibleStash, invRect),
@@ -212,7 +350,7 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         if (inventory != null)
         {
             var stashRect = rectElement.GetClientRectCache;
-            var (itemFilter, isCustomFilter) = GetPredicate("Custom stash filter", ref _customStashFilter, stashRect.BottomLeft.ToVector2Num()) is { } customPredicate
+            var (itemFilter, isCustomFilter) = entityPredicate is { } customPredicate
                 ? ((Predicate<NormalInventoryItem>)(s => customPredicate(s.Item)), true)
                 : (s => s.isHighlighted != Settings.InvertSelection.Value, false);
 
@@ -264,20 +402,13 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                 _currentOperation = MoveItemsToInventory(orderedItems);
             }
         }
-        else
-        {
-            if (Settings.ResetCustomFilterOnPanelClose)
-            {
-                _customStashFilter = "";
-            }
-        }
 
         var inventoryPanel = InGameState.IngameUi.InventoryPanel;
         if (inventoryPanel.IsVisible)
         {
             var inventoryRect = inventoryPanel[2].GetClientRectCache;
 
-            var (itemFilter, isCustomFilter) = GetPredicate("Custom inventory filter", ref _customInventoryFilter, inventoryRect.BottomLeft.ToVector2Num()) is { } customPredicate
+            var (itemFilter, isCustomFilter) = entityPredicate is { } customPredicate
                 ? (customPredicate, true)
                 : (_ => true, false);
 
@@ -321,13 +452,6 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
 
                     _currentOperation = MoveItemsToStash(inventoryItems);
                 }
-            }
-        }
-        else
-        {
-            if (Settings.ResetCustomFilterOnPanelClose)
-            {
-                _customInventoryFilter = "";
             }
         }
     }
